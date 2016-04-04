@@ -3,14 +3,6 @@ package CoveragePropertyDSL
 import Chisel._
 import scala.collection.mutable._
 
-object Hi {
-  def main(args: Array[String]) = println("Hi!")
-}
-
-object CoverProperty {
-    def testFunc() = println("Testing")
-}
-
 trait CanGenFSM {
     def genFSM(): (Bool, Bool, Bool) //returned tuple contains chisel wires for activate(FSM input to activate FSM), done(FSM output indicating completion), occurred(FSM output indicating that the sequence occurred)
 }
@@ -41,7 +33,12 @@ class StartSequence(chiselWire: Bool) extends AtomicSequence(chiselWire) {
         val active = Bool()
         val occurred = Bool()
         occurred := DUTSignal
-        val done = Bool(true)
+
+        val done = Bool()
+        done := Bool(false)
+        when(active) {
+            done := Bool(true)
+        }
 
         return (active, done, occurred)
     }
@@ -57,7 +54,7 @@ class DelaySequence(chiselWire: Bool, numCycles: Int) extends AtomicSequence(chi
 
         //FSM state reset and update
         val done = Bool() 
-        val counter = Reg(UInt(1, width=32))
+        val counter = Reg(init = UInt(1, width=32))
         when(active) {
             when(!done) {
                 counter := counter + UInt(1)
@@ -68,7 +65,10 @@ class DelaySequence(chiselWire: Bool, numCycles: Int) extends AtomicSequence(chi
         }
 
         //FSM output assignments
-        done := counter === UInt(numDelayedCycles)
+        done := Bool(false)
+        when(active) {
+            done := counter === UInt(numDelayedCycles)
+        }
         val occurred = Bool()
         occurred := DUTSignal
 
@@ -94,7 +94,7 @@ class ConcatSequence(atomicSequences: ArrayBuffer[AtomicSequence]) extends Seque
         val occurred = Bool()
 
         //FSM state reset and update
-        val currentState = Reg(UInt(0, width = 32))
+        val currentState = Reg(init = UInt(0, width = 32))
         val nextState = UInt(width = 32)
         currentState := nextState
 
@@ -102,8 +102,9 @@ class ConcatSequence(atomicSequences: ArrayBuffer[AtomicSequence]) extends Seque
         nextState := currentState
         done := Bool(false)
         occurred := Bool(false)
-        when (active) {
-            for (childNum <- 0 to children.length) {//state update and output when current state corresponds to all child FSMs before the last one
+        for (childNum <- 0 to (children.length - 1)) {//state update and output when current state corresponds to all child FSMs before the last one
+            childFSMActiveWires(childNum) := Bool(false)
+            when (active) {
                 when (currentState === UInt(childNum)) {
                     childFSMActiveWires(childNum) := Bool(true)
                     when (childFSMDoneWires(childNum)) {
@@ -127,5 +128,23 @@ class ConcatSequence(atomicSequences: ArrayBuffer[AtomicSequence]) extends Seque
         }
 
         return (active, done, occurred)
+    }
+}
+
+class ImplicationStatement(ifSequence: Sequence, thenSequence: Sequence) {
+
+    def genFSM(): (Bool, Bool, Bool, Bool) = {
+        //FSM input signal
+        val active = Bool()
+
+        //FSM output signals
+        val done = Bool()
+        val attempted = Bool()
+        val matched = Bool()
+
+        //FSM state reset and update
+        val currentState = Reg(init = UInt(0, width = 32))
+        val nextState = UInt(width = 32)
+        return (active, done, attempted, matched)
     }
 }
