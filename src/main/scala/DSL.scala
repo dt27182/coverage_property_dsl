@@ -3,36 +3,50 @@ package CoveragePropertyDSL
 import Chisel._
 import scala.collection.mutable._
 
-trait CanGenFSM {
-    def genFSM(): (Bool, Bool, Bool) //returned tuple contains chisel wires for activate(FSM input to activate FSM), done(FSM output indicating completion), occurred(FSM output indicating that the sequence occurred)
+object seq {
+    def apply(chiselWire: Bool): AtomicSequence = new AtomicSequence(chiselWire)
 }
 
-abstract class Sequence extends CanGenFSM{
-    val children:ArrayBuffer[Sequence] = new ArrayBuffer[Sequence]()
+object cover {
+    def apply(implication: ImplicationStatement): (UInt, UInt) = genMonitorFSM(new CoverageStatement(implication))
+}
 
-    def genChildFSMs(): (ArrayBuffer[Bool], ArrayBuffer[Bool], ArrayBuffer[Bool]) = {
-        val childFSMActiveWires: ArrayBuffer[Bool] = new ArrayBuffer[Bool]()
-        val childFSMDoneWires: ArrayBuffer[Bool] = new ArrayBuffer[Bool]()
-        val childFSMOccurredWires: ArrayBuffer[Bool] = new ArrayBuffer[Bool]()
-        for(child <- children) {
-            val (active, done, occurred) = child.genFSM()
-            childFSMActiveWires += active
-            childFSMDoneWires += done
-            childFSMOccurredWires += occurred
-        }
-        return (childFSMActiveWires, childFSMDoneWires, childFSMOccurredWires)
+abstract class Sequence {
+    def ##(numDelayedCycles: Int): DelaySequence = new DelaySequence(this, seq(Bool()), numDelayedCycles)    
+    //def ##(numDelayedCycles: Int, rhs: Sequence) = new DelaySequence(this, rhs, numDelayedCycles)    
+    def |=>(thenSeq: Sequence): ImplicationStatement = new ImplicationStatement(this, thenSeq)
+}
+
+class AtomicSequence(val chiselWire: Bool) extends Sequence
+
+class DelaySequence(val lhs: Sequence, var rhs: Sequence, val numDelayedCycles: Int) extends Sequence {
+    def ##(rhs: Sequence): DelaySequence = {
+        this.rhs = rhs
+        this
     }
+    assert (numDelayedCycles > 0)
 }
 
-abstract class AtomicSequence(chiselWire: Bool) extends Sequence {
-    val DUTSignal: Bool = chiselWire
-}
+class ImplicationStatement(val ifSequence: Sequence, val thenSequence: Sequence)
 
-class StartSequence(chiselWire: Bool) extends AtomicSequence(chiselWire) {
-    override def genFSM(): (Bool, Bool, Bool) = {
+class CoverageStatement(val implicationStatement: ImplicationStatement)
+
+object genMonitorFSM {
+    def apply(sequence: Sequence): (Bool, Bool, Bool) = {
+        sequence match {
+            case seq: AtomicSequence => genMonitorFSM(seq)
+            case seq: DelaySequence => genMonitorFSM(seq)
+            case _ => {
+                assert(false)
+                (Bool(), Bool(), Bool())
+            }
+        }
+    }
+
+    def apply(atomicSequence: AtomicSequence): (Bool, Bool, Bool) = {
         val active = Bool()
         val occurred = Bool()
-        occurred := DUTSignal
+        occurred := atomicSequence.chiselWire
 
         val done = Bool()
         done := Bool(false)
@@ -42,86 +56,71 @@ class StartSequence(chiselWire: Bool) extends AtomicSequence(chiselWire) {
 
         return (active, done, occurred)
     }
-}
 
-class DelaySequence(chiselWire: Bool, numCycles: Int) extends AtomicSequence(chiselWire) {
-    assert (numCycles > 0)
-    val numDelayedCycles = numCycles
+    def apply(delaySequence: DelaySequence): (Bool, Bool, Bool) = {
+        val (lhsActive, lhsDone, lhsOccurred) = genMonitorFSM(delaySequence.lhs)
+        val (rhsActive, rhsDone, rhsOccurred) = genMonitorFSM(delaySequence.rhs)
 
-    override def genFSM(): (Bool, Bool, Bool) = {
+
         //FSM input signal
         val active = Bool()
 
         //FSM state reset and update
-        val done = Bool() 
-        val counter = Reg(init = UInt(1, width=32))
-        when(active) {
-            when(!done) {
-                counter := counter + UInt(1)
-            }.otherwise {
-                counter := UInt(1)
+        val runningLeftHandSide = 0
+        val runningRightHandSide = delaySequence.numDelayedCycles
+        val currentState = Reg(init = UInt(runningLeftHandSide, width = 32))
+        when (active) {
+            when (currentState === UInt(runningLeftHandSide)) {
+                when (lhsDone) {
+                    when (lhsOccurred) {
+                        currentState := UInt(runningLeftHandSide + 1)
+                    }
+                }
             }
-
+            if (delaySequence.numDelayedCycles > 1) {
+                for (i <- 1 to (delaySequence.numDelayedCycles - 1)) {
+                    when (currentState === UInt(i)) {
+                         currentState := currentState + UInt(1) 
+                    }
+                }
+            }
+            when (currentState === UInt(runningRightHandSide)) {
+                when (rhsDone) {
+                    currentState := UInt(runningLeftHandSide)
+                }
+            }
         }
 
-        //FSM output assignments
-        done := Bool(false)
-        when(active) {
-            done := counter === UInt(numDelayedCycles)
+        //lhs monitor FSM and lhs monitor FSM control signals
+        lhsActive := Bool(false)
+        rhsActive := Bool(false)
+        when (active) {
+            when (currentState === UInt(runningLeftHandSide)) {
+                lhsActive := Bool(true)
+            }
+            when (currentState === UInt(runningRightHandSide)) {
+                rhsActive := Bool(true)
+            }
         }
-        val occurred = Bool()
-        occurred := DUTSignal
-
-        return (active, done, occurred)
-    }
-}
-
-class ConcatSequence(atomicSequences: ArrayBuffer[AtomicSequence]) extends Sequence {
-    assert (atomicSequences.length > 1)
-    assert (atomicSequences(0).isInstanceOf[StartSequence])
-    for (atomicSequence <- atomicSequences) {
-        children += atomicSequence
-    }
-
-    override def genFSM(): (Bool, Bool, Bool) = {
-        val (childFSMActiveWires, childFSMDoneWires, childFSMOccurredWires) = genChildFSMs()
-        
-        //FSM input signal
-        val active = Bool()
 
         //FSM output signals
         val done = Bool()
         val occurred = Bool()
-
-        //FSM state reset and update
-        val currentState = Reg(init = UInt(0, width = 32))
-        val nextState = UInt(width = 32)
-        currentState := nextState
-
-        //FSM nextState and output logic
-        nextState := currentState
         done := Bool(false)
         occurred := Bool(false)
-        for (childNum <- 0 to (children.length - 1)) {//state update and output when current state corresponds to all child FSMs before the last one
-            childFSMActiveWires(childNum) := Bool(false)
-            when (active) {
-                when (currentState === UInt(childNum)) {
-                    childFSMActiveWires(childNum) := Bool(true)
-                    when (childFSMDoneWires(childNum)) {
-                        if (childNum < children.length - 1) {
-                            when (childFSMOccurredWires(childNum)) {
-                                nextState := currentState + UInt(1)
-                            }.otherwise {
-                                done := Bool(true)
-                                nextState := UInt(0)
-                            }
-                        } else {
-                            done := Bool(true)
-                            nextState := UInt(0)
-                            when (childFSMOccurredWires(children.length - 1)) {
-                                occurred := Bool(true)
-                            }
-                        }
+        when (active) {
+            when (currentState === UInt(runningLeftHandSide)) {
+                when (lhsDone) {
+                    when (!lhsOccurred) {
+                        done := Bool(true)
+                    }
+                }
+            }
+            when (currentState === UInt(runningRightHandSide)) {
+                when (rhsDone) {
+                    done := Bool(true)
+                    when (rhsOccurred) {
+                        occurred := Bool(true)
                     }
                 }
             }
@@ -129,22 +128,131 @@ class ConcatSequence(atomicSequences: ArrayBuffer[AtomicSequence]) extends Seque
 
         return (active, done, occurred)
     }
-}
 
-class ImplicationStatement(ifSequence: Sequence, thenSequence: Sequence) {
 
-    def genFSM(): (Bool, Bool, Bool, Bool) = {
+    def apply(implicationStatement: ImplicationStatement): (Bool, Bool, Bool, Bool) = {
+        //gen children FSMs
+        val (ifSeqFSMActive, ifSeqFSMDone, ifSeqFSMOccurred) = genMonitorFSM(implicationStatement.ifSequence)
+        val (thenSeqFSMActive, thenSeqFSMDone, thenSeqFSMOccurred) = genMonitorFSM(implicationStatement.thenSequence)
+
         //FSM input signal
         val active = Bool()
+
+        //FSM state reset and update
+        val checkingIfSeq = 0
+        val checkingThenSeq = 1
+        val currentState = Reg(init = UInt(checkingIfSeq))
+        when(active) {
+            when(currentState === UInt(checkingIfSeq)) {
+                when(ifSeqFSMDone) {
+                    when(ifSeqFSMOccurred) {
+                        currentState := UInt(checkingThenSeq)
+                    }
+                }
+            }.elsewhen(currentState === UInt(checkingThenSeq)) {
+                when(thenSeqFSMDone) {
+                    currentState := UInt(checkingIfSeq)
+                }
+            }
+        }
+
+        //child FSM control signals
+        ifSeqFSMActive := Bool(false)
+        thenSeqFSMActive := Bool(false)
+        when(active) {
+            when(currentState === UInt(checkingIfSeq)) {
+                ifSeqFSMActive := Bool(true)
+            }.elsewhen(currentState === UInt(checkingThenSeq)) {
+                thenSeqFSMActive := Bool(true)
+            }
+        }
 
         //FSM output signals
         val done = Bool()
         val attempted = Bool()
         val matched = Bool()
-
-        //FSM state reset and update
-        val currentState = Reg(init = UInt(0, width = 32))
-        val nextState = UInt(width = 32)
+        done := Bool(false)
+        attempted := Bool(false)
+        matched := Bool(false)
+        when(active) {
+            when(currentState === UInt(checkingIfSeq)) {
+                when(ifSeqFSMDone) {
+                    when(ifSeqFSMOccurred) {
+                        attempted := Bool(true)
+                    }.otherwise {
+                        done := Bool(true)
+                    }
+                }
+            }.elsewhen(currentState === UInt(checkingThenSeq)) {
+                when(thenSeqFSMDone) {
+                    done := Bool(true)
+                    when(thenSeqFSMOccurred) {
+                        matched := Bool(true)
+                    }
+                }
+            }
+        }
+        
         return (active, done, attempted, matched)
     }
+
+    def apply(coverageStatement: CoverageStatement): (UInt, UInt) = {
+        val monitorFSMActiveBitVector = Bits(width = getMaxRunCycles(coverageStatement.implicationStatement))
+        val monitorFSMDoneBitVector = Bits(width = getMaxRunCycles(coverageStatement.implicationStatement))
+        val monitorFSMAttemptedBitVector = Bits(width = getMaxRunCycles(coverageStatement.implicationStatement))
+        val monitorFSMMatchedBitVector = Bits(width = getMaxRunCycles(coverageStatement.implicationStatement))
+        monitorFSMActiveBitVector := Bits(0)
+        monitorFSMDoneBitVector := Bits(0)
+        monitorFSMAttemptedBitVector := Bits(0)
+        monitorFSMMatchedBitVector := Bits(0)
+        for (i <- 1 to getMaxRunCycles(coverageStatement.implicationStatement)) {
+            val (active, done, attempted, matched) = genMonitorFSM(coverageStatement.implicationStatement)
+            active := monitorFSMActiveBitVector(i - 1)
+            monitorFSMDoneBitVector(i - 1) := done
+            monitorFSMAttemptedBitVector(i - 1) := attempted
+            monitorFSMMatchedBitVector(i - 1) := matched
+        }
+        
+        //manage update of monitor free list
+        val monitorFreeList = Reg(init = ~Bits(0, width = getMaxRunCycles(coverageStatement.implicationStatement)) )
+        val nextFreeMonitorOH = PriorityEncoderOH(monitorFreeList)
+        monitorFreeList := (monitorFreeList ^ nextFreeMonitorOH ) | monitorFSMDoneBitVector
+
+        //manage monitor FSM active inputs
+        monitorFSMActiveBitVector := nextFreeMonitorOH | (~monitorFreeList)
+
+        //manage num attempted and num matched counters
+        val numAttempted = Reg(init = UInt(0, width=32))
+        val numMatched = Reg(init = UInt(0, width=32))
+        var nextNumAttempted = UInt(0, width=32)
+        var nextNumMatched = UInt(0, width=32)
+        for (i <- 0 to getMaxRunCycles(coverageStatement.implicationStatement) - 1) {
+            nextNumAttempted = nextNumAttempted + monitorFSMAttemptedBitVector(i)
+            nextNumMatched = nextNumMatched + monitorFSMMatchedBitVector(i)
+        }
+        numAttempted := nextNumAttempted
+        numMatched := nextNumMatched
+
+        return (nextNumAttempted, nextNumMatched)
+    }
 }
+
+object getMaxRunCycles {
+    def apply(sequence: Sequence): Int = {
+        sequence match {
+            case seq: AtomicSequence => getMaxRunCycles(seq)
+            case seq: DelaySequence => getMaxRunCycles(seq)
+            case _ => {
+                assert(false)
+                -1
+            }
+        }
+    }
+
+    def apply(atomicSequence: AtomicSequence): Int = 1
+
+    def apply(delaySequence: DelaySequence): Int = getMaxRunCycles(delaySequence.lhs) + (delaySequence.numDelayedCycles - 1) + getMaxRunCycles(delaySequence.rhs)
+
+    def apply(implicationStatement: ImplicationStatement): Int = getMaxRunCycles(implicationStatement.ifSequence) + getMaxRunCycles(implicationStatement.thenSequence)
+}
+

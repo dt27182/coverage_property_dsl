@@ -8,7 +8,7 @@ run-vcs:
 	sbt "run TestRunner --backend v --genHarness"
 
 clean:
-	rm -f *Module
+	rm -f *Module*
 	rm -f *.cpp
 	rm -f *.o
 	rm -f *.h
