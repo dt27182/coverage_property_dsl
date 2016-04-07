@@ -1,5 +1,7 @@
 *.swp
 *.swn
+*.cpp
+*.h
 target/*
 project/*
 *.idea
